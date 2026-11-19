@@ -6,5 +6,8 @@
   "apps": {},
   "lang": "en-US",
   "model": "qwen2.5:7b",
-  "keep_alive": "30m"
+  "keep_alive": "30m",
+  "features": {
+    "camera": false
+  }
 }

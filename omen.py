@@ -6,6 +6,8 @@ import os
 import sys
 
 HOME_DIR = os.environ.get("OMEN_HOME") or os.path.join(os.path.expanduser("~"), "Omen")
+if "--home" in sys.argv[:-1]:  # python omen.py --home C:\\path\\to\\data
+    HOME_DIR = sys.argv[sys.argv.index("--home") + 1]
 if sys.stdout is None or sys.stderr is None:  # running windowless (pythonw): log to a file
     os.makedirs(os.path.join(HOME_DIR, "logs"), exist_ok=True)
     sys.stdout = sys.stderr = open(os.path.join(HOME_DIR, "logs", "omen.log"), "a", buffering=1, encoding="utf-8")
@@ -24,7 +26,8 @@ from pydantic import BaseModel
 BASE = pathlib.Path(HOME_DIR)
 CFG_FILE = BASE / "config.json"
 CFG = {"name": "Omen", "ntfy_topic": "", "pin": "",
-       "public_url": "", "apps": {}, "lang": "en-US", "model": "qwen2.5:7b", "keep_alive": "30m"}
+       "public_url": "", "apps": {}, "lang": "en-US", "model": "qwen2.5:7b", "keep_alive": "30m",
+       "features": {"camera": False}}
 BASE.mkdir(parents=True, exist_ok=True)
 if CFG_FILE.exists():
     CFG.update(json.loads(CFG_FILE.read_text(encoding="utf-8")))
@@ -33,6 +36,7 @@ if not CFG["pin"]:  # first run: make a random 6-digit PIN and save it
 CFG_FILE.write_text(json.dumps(CFG, indent=2), encoding="utf-8")
 NAME, NTFY_TOPIC, PIN = CFG["name"], CFG["ntfy_topic"], CFG["pin"]
 PUBLIC_URL = CFG["public_url"].rstrip("/")
+FEATURES = {"camera": False, **CFG["features"]}  # risky features are off unless you turn them on
 MODEL = CFG["model"]             # change in config.json, e.g. "qwen2.5:3b" for more speed
 HOST, PORT = "127.0.0.1", 8000  # stays local; Tailscale publishes it privately
 KEEP_ALIVE = CFG["keep_alive"]     # how long the model stays in GPU memory
@@ -63,17 +67,49 @@ history = [{"role": "system", "content": SYSTEM}]
 jobs = {}
 gpu = threading.Lock()  # one model call at a time on a 6 GB GPU
 app = FastAPI()
-TOKEN = hashlib.sha256(("omen:" + PIN).encode()).hexdigest()
-fails = {"n": 0, "until": 0.0}
+SESS_FILE = BASE / "sessions.json"
+SESSION_DAYS = 30
+fails = {"n": 0, "strikes": 0, "until": 0.0}
+
+
+def _load_sessions() -> dict:
+    try:
+        now = time.time()
+        return {k: v for k, v in json.loads(SESS_FILE.read_text(encoding="utf-8")).items() if v > now}
+    except Exception:
+        return {}
+
+
+sessions = _load_sessions()  # sha256(token) -> expiry; the token itself is never stored
+
+
+def _save_sessions():
+    SESS_FILE.write_text(json.dumps(sessions), encoding="utf-8")
+
+
+def _hash(tok: str) -> str:
+    return hashlib.sha256(tok.encode()).hexdigest()
+
+
+def _authed(request: Request) -> bool:
+    tok = request.cookies.get("omen")
+    return bool(tok and sessions.get(_hash(tok), 0) > time.time())
 
 
 @app.middleware("http")
 async def gate(request: Request, call_next):
-    if request.url.path == "/login" or request.cookies.get("omen") == TOKEN:
-        return await call_next(request)
-    if request.method == "GET" and (request.url.path == "/" or request.url.path.startswith(("/report", "/camera", "/file"))):
-        return HTMLResponse(LOGIN.replace("__NAME__", NAME))
-    return JSONResponse({"error": "locked"}, status_code=401)
+    if request.url.path == "/login" or _authed(request):
+        resp = await call_next(request)
+    elif request.method == "GET" and (request.url.path == "/" or request.url.path.startswith(("/report", "/camera", "/file"))):
+        resp = HTMLResponse(LOGIN.replace("__NAME__", NAME))
+    else:
+        resp = JSONResponse({"error": "locked"}, status_code=401)
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Content-Security-Policy"] = ("default-src 'self'; script-src 'unsafe-inline'; "
+                                               "style-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'")
+    return resp
 
 
 class Msg(BaseModel):
@@ -81,18 +117,33 @@ class Msg(BaseModel):
 
 
 @app.post("/login")
-def login(m: Msg):
+def login(m: Msg, request: Request):
     if time.time() < fails["until"]:
         return JSONResponse({"ok": False, "wait": True}, status_code=429)
-    if secrets.compare_digest(m.text.strip(), PIN):
-        fails["n"] = 0
+    if secrets.compare_digest(m.text.strip().encode(), PIN.encode()):
+        fails.update(n=0, strikes=0)
+        tok = secrets.token_urlsafe(32)
+        sessions[_hash(tok)] = time.time() + SESSION_DAYS * 86400
+        _save_sessions()
         r = JSONResponse({"ok": True})
-        r.set_cookie("omen", TOKEN, httponly=True, samesite="strict", max_age=60 * 60 * 24 * 30)
+        r.set_cookie("omen", tok, httponly=True, samesite="strict", max_age=SESSION_DAYS * 86400,
+                     secure=request.headers.get("x-forwarded-proto") == "https")
         return r
     fails["n"] += 1
-    if fails["n"] >= 5:
-        fails.update(n=0, until=time.time() + 60)
+    if fails["n"] >= 5:  # lock out for 1, 2, 4... minutes (max 15) after each run of 5 wrong tries
+        fails.update(n=0, strikes=fails["strikes"] + 1, until=time.time() + min(900, 60 * 2 ** fails["strikes"]))
     return JSONResponse({"ok": False}, status_code=401)
+
+
+@app.post("/logout")
+def logout(request: Request):
+    tok = request.cookies.get("omen")
+    if tok:
+        sessions.pop(_hash(tok), None)
+        _save_sessions()
+    r = JSONResponse({"ok": True})
+    r.delete_cookie("omen")
+    return r
 
 
 def notify(title: str, body: str, click: str = ""):
@@ -370,7 +421,7 @@ def _pick_tools(text: str):
         if any(w in t for w in words):
             names += [x for x in tools if x not in names]
     allf = {**SAFE, **RISKY}
-    return [allf[n] for n in names] or None
+    return [allf[n] for n in names if n in allf] or None
 
 
 PLACES = {"downloads", "documents", "desktop", "pictures", "videos", "music"}
@@ -379,9 +430,9 @@ PLACES = {"downloads", "documents", "desktop", "pictures", "videos", "music"}
 def _fast_path(text: str):
     """Obvious one-line commands skip the model: instant, and they cannot be misunderstood."""
     low = text.strip().lower().rstrip(".!?")
-    if low in ("camera photo", "take a photo", "take a picture", "take a snapshot", "camera snapshot", "show camera"):
+    if FEATURES["camera"] and low in ("camera photo", "take a photo", "take a picture", "take a snapshot", "camera snapshot", "show camera"):
         return "camera_snapshot", {}
-    if low in ("stop watch", "stop watching", "stop the watch", "stop camera watch"):
+    if FEATURES["camera"] and low in ("stop watch", "stop watching", "stop the watch", "stop camera watch"):
         return "watch_stop", {}
     raw = text.strip().rstrip(".!?")
     m = re.fullmatch(r"(?:please )?remind me in (\d+(?:\.\d+)?) (min|mins|minute|minutes|hour|hours) (?:to |that )?(.+)", raw, re.I)
@@ -643,6 +694,12 @@ RISKY = {"open_path": open_path, "open_app": open_app, "close_app": close_app, "
          "send_file": send_file, "camera_snapshot": camera_snapshot, "watch_start": watch_start}
 
 
+if not FEATURES["camera"]:
+    for _n in ("camera_snapshot", "watch_start"):
+        RISKY.pop(_n, None)
+    SAFE.pop("watch_stop", None)
+
+
 def _label(name, args):
     v = args.get("path") or args.get("name") or args.get("hours") or ""
     extra = {"close_app": " (FORCE: unsaved work is lost)" if args.get("force") else " (unsaved work may be lost)",
@@ -772,6 +829,8 @@ def action(a: Act):
         del history[1:]
         CHAT.unlink(missing_ok=True)
         return {"body": "Chat history cleared. Saved notes and reminders are kept."}
+    if a.tool in ("camera_snapshot", "watch_start", "watch_stop") and not FEATURES["camera"]:
+        return {"body": 'The camera feature is off. Set "features": {"camera": true} in config.json to turn it on.'}
     if a.tool in ("open_app", "close_app", "close_folder", "open_path"):
         args = {"path": a.name} if a.tool == "open_path" else {"name": a.name}
         if a.tool == "close_app" and a.force:
@@ -942,7 +1001,8 @@ def list_jobs():
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return PAGE.replace("__NAME__", NAME).replace("__LANG__", CFG["lang"])
+    page = PAGE.replace("__NAME__", NAME).replace("__LANG__", CFG["lang"])
+    return page if FEATURES["camera"] else page.replace("</style></head>", ".cam{display:none}</style></head>", 1)
 
 
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -1004,12 +1064,13 @@ button{border:0;border-radius:12px;padding:0 16px;font:inherit;font-weight:600;c
 <ellipse class="mouth" cx="100" cy="122" rx="12" ry="2"/></svg></div><div class="st"></div></section>
 <main><div id="log"><div class="m">Hi, I'm __NAME__. Ask me something, or press "Run as task" to have me work on it in the background and notify you when it's done.</div></div>
 <aside><h2>Background tasks</h2><div id="jobs">None yet.</div></aside></main>
-<div id="quick"><button class="q" onclick="quick('camera_snapshot')">Camera photo</button>
-<button class="q" onclick="quick('watch_start',10)">Watch office 10h</button>
-<button class="q" onclick="quick('watch_stop')">Stop watch</button>
+<div id="quick"><button class="q cam" onclick="quick('camera_snapshot')">Camera photo</button>
+<button class="q cam" onclick="quick('watch_start',10)">Watch office 10h</button>
+<button class="q cam" onclick="quick('watch_stop')">Stop watch</button>
 <button class="q" id="vo" onclick="toggleVoice()">Voice: off</button>
 <button class="q" onclick="quick('clear_chat')">Clear chat</button>
-<button class="q" onclick="showApps()">Apps and folders</button></div>
+<button class="q" onclick="showApps()">Apps and folders</button>
+<button class="q" onclick="fetch('/logout',{method:'POST'}).then(()=>location.reload())">Log out</button></div>
 <form id="f"><input id="t" placeholder="Type a message or a task" autocomplete="off">
 <button id="mic" type="button" aria-label="Talk">Talk</button><button id="send" type="submit">Send</button><button id="task" type="button">Run as task</button></form>
 <script>
