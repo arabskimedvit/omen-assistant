@@ -1,0 +1,19 @@
+# Private data: never commit these
+config.json
+*.log
+logs/
+chat.json
+memory.json
+camera/
+reports/
+data/
+Omen/
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/

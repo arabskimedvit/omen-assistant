@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+ollama
+ddgs
+python-docx
+opencv-python

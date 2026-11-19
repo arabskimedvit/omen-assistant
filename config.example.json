@@ -1,0 +1,10 @@
+{
+  "name": "Omen",
+  "ntfy_topic": "",
+  "pin": "",
+  "public_url": "",
+  "apps": {},
+  "lang": "en-US",
+  "model": "qwen2.5:7b",
+  "keep_alive": "30m"
+}
