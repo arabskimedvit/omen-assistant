@@ -5,7 +5,7 @@ A self-hosted personal AI assistant for Windows. It runs a local language model 
 > **Status: personal project, v0.1.** Built with AI assistance (Claude) and tested on one machine. It has not been security-audited. Do not expose it to the open internet. See [Security](#security-and-limits).
 
 <!-- TODO: add a short demo GIF or screenshots in docs/ (blur your PIN, hostname, files, and any camera images) -->
-
+Why I built this. I wanted a Jarvis-style assistant that runs on my own PC, controls it from my phone when I'm away from the office, and doesn't depend on a subscription. I started with a modest machine, a GTX 1660 Ti with 6 GB of memory, so a lot of the work went into making a small local model fast and safe enough to trust with real actions. I built it with AI assistance, and I tested, debugged, and made the design choices myself.
 ## What it does
 
 - **Chat** with a local model (default `qwen2.5:7b`), streamed to a web page with an orb that thinks and talks.
